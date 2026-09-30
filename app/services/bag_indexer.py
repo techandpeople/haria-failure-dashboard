@@ -78,7 +78,9 @@ def wipe_dir(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path, ignore_errors=True)
     path.mkdir(parents=True, exist_ok=True)
-    session_cache.invalidate()
+    # Scope invalidation to this dir so rebuilding one bag doesn't clear the
+    # in-memory caches of other bags open in concurrent sessions.
+    session_cache.invalidate(str(path))
 
 
 def find_bag_root(base: Path) -> Path:

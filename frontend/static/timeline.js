@@ -944,6 +944,14 @@ function TimelineContainer({ mode, tStart, tEnd, topicIndex, onTimeChange, onSto
             {playing ? '❚❚ Pause' : '▶ Play'}
           </button>
         )}
+        {recording && (
+          <button className="tb-stop" style={{ borderLeft:'1px solid var(--black)', padding:'0 16px', opacity: stopping ? 0.5 : 1 }}
+            disabled={stopping}
+            onClick={async () => { setStopping(true); try { await onStop?.(); } finally { setStopping(false); } }}
+            title="Stop the live recording">
+            {stopping ? '… Stopping' : '■ Stop'}
+          </button>
+        )}
       </div>
 
       {/* Task-phase lane (only when the bag has /task_state/phase) */}

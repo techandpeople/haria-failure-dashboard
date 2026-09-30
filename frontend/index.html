@@ -33,6 +33,13 @@ window.HARIA_ANN_CATEGORIES = [];
 // Session-only codebook categories (uploaded during a playback session, never
 // persisted): [{id, label, color, labels:[...]}]. Cleared when a session opens.
 window.HARIA_CODEBOOK = [];
+// Current playback bag key (multi-session). Empty = legacy single-slot / record.
+// Every topic/session fetch appends `?bag=…` via hbag() so concurrent viewers
+// of different bags each read their own cache.
+window.HARIA_BAG = '';
+window.hbag = function (hasQuery) {
+  return window.HARIA_BAG ? `${hasQuery ? '&' : '?'}bag=${encodeURIComponent(window.HARIA_BAG)}` : '';
+};
 function _catRecord(categoryId) {
   return (window.HARIA_ANN_CATEGORIES || []).find(c => c.id === categoryId)
       || (window.HARIA_CODEBOOK || []).find(c => c.id === categoryId);
@@ -219,7 +226,13 @@ window.HariaImportCodebook = function (text, filename) {
 window.HariaResetCodebook = function () { window.HARIA_CODEBOOK = []; };
 
 // ── Home ──────────────────────────────────────────────────────────────
-function Home({ onRecord, onPlayback, onAnnotations, onOpenRecording }) {
+function _flattenTree(node, out) {
+  if (!node) return out;
+  if (node.is_bag) out.push({ name: node.rel || node.name, path: node.path });
+  (node.children || []).forEach(c => _flattenTree(c, out));
+  return out;
+}
+function Home({ workingFolder, user, onChangeUser, onChangeFolder, onRecord, onPlayback, onAnnotations, onOpenRecording, onOpenBag }) {
   const [recordings, setRecordings] = useState([]);
   const [loaded, setLoaded] = useState(false);
   // Height of the cards grid in px; null = natural height. Persisted so the
@@ -253,17 +266,29 @@ function Home({ onRecord, onPlayback, onAnnotations, onOpenRecording }) {
   }
 
   useEffect(() => {
-    fetch(`${API}/recordings`)
-      .then(r => r.ok ? r.json() : [])
-      .then(arr => {
-        if (!Array.isArray(arr)) return;
-        const usable = arr.filter(r => r.has_metadata || (r.mcap_files || []).length > 0);
-        usable.sort((a, b) => (b.start_time_ns || 0) - (a.start_time_ns || 0));
-        setRecordings(usable);
-      })
-      .catch(() => {})
-      .finally(() => setLoaded(true));
-  }, []);
+    setLoaded(false);
+    if (workingFolder) {
+      // Every bag anywhere under the folder (recursive), plus any loose
+      // archives sitting in it (.zip/.tar.gz) that can be imported.
+      Promise.all([
+        fetch(`${API}/folders/tree?path=${encodeURIComponent(workingFolder)}`).then(r => r.ok ? r.json() : null).then(d => d && d.tree ? _flattenTree(d.tree, []) : []),
+        fetch(`${API}/folders/browse?path=${encodeURIComponent(workingFolder)}`).then(r => r.ok ? r.json() : null).then(d => ((d && d.files) || []).filter(f => f.kind === 'archive').map(f => ({ name: f.name, path: f.path, kind: 'archive' }))),
+      ]).then(([bags, archives]) => setRecordings([...bags, ...archives]))
+        .catch(() => setRecordings([]))
+        .finally(() => setLoaded(true));
+    } else {
+      fetch(`${API}/recordings`)
+        .then(r => r.ok ? r.json() : [])
+        .then(arr => {
+          if (!Array.isArray(arr)) { setRecordings([]); return; }
+          const usable = arr.filter(r => r.has_metadata || (r.mcap_files || []).length > 0);
+          usable.sort((a, b) => (b.start_time_ns || 0) - (a.start_time_ns || 0));
+          setRecordings(usable);
+        })
+        .catch(() => {})
+        .finally(() => setLoaded(true));
+    }
+  }, [workingFolder]);
 
   function fmtDate(ns) {
     if (!ns) return '—';
@@ -271,11 +296,34 @@ function Home({ onRecord, onPlayback, onAnnotations, onOpenRecording }) {
     return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
   }
 
+  async function importArchive(a) {
+    try {
+      const r = await fetch(`${API}/folders/import-archive?path=${encodeURIComponent(a.path)}`, { method:'POST' });
+      if (!r.ok) throw new Error(await r.text());
+      const d = await r.json();
+      onOpenBag(d.path, a.name.replace(/\.(zip|tar\.gz|tgz)$/i, ''));
+    } catch (e) { alert('Could not import archive: ' + String(e).replace(/^Error:\s*/, '')); }
+  }
+
+  function openRow(rec) {
+    if (rec.kind === 'archive') importArchive(rec);
+    else if (rec.path) onOpenBag(rec.path, rec.name);
+    else onOpenRecording(rec.name);
+  }
+
   return (
     <div className="mode-screen fade-in">
-      <div className="mode-top">
+      <div className="mode-top" style={{ position:'relative' }}>
         <div className="brand">HARIA</div>
         <div className="brand-sub">Failure Dashboard · ROS 2 Jazzy</div>
+        {user && (
+          <button onClick={onChangeUser} title="Switch user"
+            style={{ position:'absolute', top:16, right:20, fontFamily:'var(--mono)', fontSize:12,
+                     padding:'6px 12px', border:'1px solid var(--black)', background:'var(--white)',
+                     cursor:'pointer', letterSpacing:'0.05em' }}>
+            hi {user}
+          </button>
+        )}
       </div>
       <div style={{ display:'flex', flexDirection:'column', overflow:'hidden' }}>
         <div className="mode-cards" ref={cardsRef}
@@ -318,36 +366,45 @@ function Home({ onRecord, onPlayback, onAnnotations, onOpenRecording }) {
         <div style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden', minHeight:0 }}>
           <div style={{ padding:'12px 48px', borderBottom:'1px solid var(--black)', fontFamily:'var(--mono)',
                         fontSize:9, letterSpacing:'0.2em', textTransform:'uppercase', color:'var(--g3)',
-                        display:'flex', justifyContent:'space-between' }}>
-            <span>Local recordings</span>
+                        display:'flex', alignItems:'center', gap:12 }}>
+            <span style={{ flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap',
+                           textTransform:'none', letterSpacing:0 }} title={workingFolder || ''}>
+              {workingFolder ? `📁 ${workingFolder}` : 'Local recordings (no folder chosen)'}
+            </span>
+            <button className="btn" style={{ padding:'2px 10px' }} onClick={onChangeFolder}>
+              {workingFolder ? 'Change folder' : 'Choose folder'}
+            </button>
             <span>{recordings.length}</span>
           </div>
           <div style={{ flex:1, overflowY:'auto' }}>
             {loaded && recordings.length === 0 && (
               <div style={{ padding:'24px 48px', fontFamily:'var(--mono)', fontSize:11, color:'var(--g3)' }}>
-                No recordings yet — start with 01 / Record.
+                {workingFolder ? 'No bags in this folder yet — record one, or choose another folder.'
+                               : 'No recordings yet — start with 01 / Record, or choose a working folder.'}
               </div>
             )}
             {recordings.map(rec => (
-              <div key={rec.name}
-                onClick={() => onOpenRecording(rec.name)}
-                title="Open in playback"
+              <div key={rec.path || rec.name}
+                onClick={() => openRow(rec)}
+                title={rec.kind === 'archive' ? 'Extract and open' : (rec.path || 'Open in playback')}
                 style={{ display:'flex', alignItems:'baseline', gap:18, padding:'10px 48px', cursor:'pointer',
                          borderBottom:'1px solid var(--g5)', fontFamily:'var(--mono)', fontSize:12 }}
                 onMouseEnter={e => e.currentTarget.style.background = 'var(--g6)'}
                 onMouseLeave={e => e.currentTarget.style.background = ''}
               >
-                <span style={{ flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{rec.name}</span>
-                <span style={{ color:'var(--g3)', fontSize:10 }}>{fmtDate(rec.start_time_ns)}</span>
-                <span style={{ color:'var(--g3)', fontSize:10, width:70, textAlign:'right' }}>
-                  {rec.duration_ns ? `${(rec.duration_ns / 1e9).toFixed(1)}s` : '—'}
-                </span>
-                <span style={{ color:'var(--g3)', fontSize:10, width:78, textAlign:'right' }}>
-                  {(rec.size_bytes / 1e6).toFixed(1)} MB
-                </span>
-                <span style={{ color:'var(--g3)', fontSize:10, width:56, textAlign:'right' }}>
-                  {rec.annotation_count != null ? `${rec.annotation_count} ann` : ''}
-                </span>
+                <span style={{ flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{rec.kind === 'archive' ? '📦' : '🤖'} {rec.name}{rec.kind === 'archive' ? '  · import' : ''}</span>
+                {rec.size_bytes != null && <>
+                  <span style={{ color:'var(--g3)', fontSize:10 }}>{fmtDate(rec.start_time_ns)}</span>
+                  <span style={{ color:'var(--g3)', fontSize:10, width:70, textAlign:'right' }}>
+                    {rec.duration_ns ? `${(rec.duration_ns / 1e9).toFixed(1)}s` : '—'}
+                  </span>
+                  <span style={{ color:'var(--g3)', fontSize:10, width:78, textAlign:'right' }}>
+                    {(rec.size_bytes / 1e6).toFixed(1)} MB
+                  </span>
+                  <span style={{ color:'var(--g3)', fontSize:10, width:56, textAlign:'right' }}>
+                    {rec.annotation_count != null ? `${rec.annotation_count} ann` : ''}
+                  </span>
+                </>}
               </div>
             ))}
           </div>
@@ -371,6 +428,254 @@ function _topicGroup(types) {
 }
 const _GROUP_ORDER = ['Cameras', 'Microphones', 'Sensors', 'Other'];
 const _GROUP_ICON  = { Cameras:'🎥', Microphones:'🎙', Sensors:'📡', Other:'🔧' };
+
+// ── Onboarding ────────────────────────────────────────────────────────
+// Asks who is working, then lets them BROWSE to any folder on the machine
+// (the backend reads the disk), remembering it per user. Bag folders open
+// directly by path — no upload.
+const _OB_BACKDROP = { position:'fixed', inset:0, background:'rgba(0,0,0,0.5)', zIndex:9998,
+                       display:'flex', alignItems:'center', justifyContent:'center' };
+const _OB_CARD = { background:'var(--white)', border:'2px solid var(--black)', boxShadow:'6px 6px 0 rgba(0,0,0,0.15)',
+                   width:'min(920px, 94vw)', height:'min(640px, 88vh)', display:'flex', flexDirection:'column', overflow:'hidden' };
+
+function Onboarding({ askUser, onUser, onOpenBag, onFolder, onClose }) {
+  const _cachedUser = (() => { try { return localStorage.getItem('haria_user') || ''; } catch { return ''; } })();
+  const [user, setUser]     = useState(_cachedUser);
+  // Skip the "who is working?" step when a user is already remembered — unless
+  // we were explicitly asked to switch user.
+  const [entered, setEntered] = useState(() => !askUser && !!_cachedUser);
+  const [recents, setRecents] = useState([]);        // per-folder recents for this user
+  const [loc, setLoc]       = useState(null);        // current browse result
+  const [loading, setLoading] = useState(false);
+  const [chosen, setChosen] = useState(null);        // remembered working folder
+  const [marker, setMarker] = useState(null);        // {path, mtime, marker} for the current folder
+  const [err, setErr]       = useState('');
+
+  async function loadRecents(folder) {
+    if (!folder) { setRecents([]); return; }
+    try {
+      const s = await (await fetch(`${API}/users/${encodeURIComponent(user)}/state?folder=${encodeURIComponent(folder)}`)).json();
+      setRecents(s.recents || []);
+    } catch { setRecents([]); }
+  }
+
+  async function loadMarker(folder) {
+    try {
+      const m = await (await fetch(`${API}/folders/marker?path=${encodeURIComponent(folder)}`)).json();
+      setMarker({ ...m, path: folder });
+      return { ...m, path: folder };
+    } catch { setMarker(null); return null; }
+  }
+
+  async function browse(path) {
+    setLoading(true); setErr('');
+    try {
+      const q = path ? `?path=${encodeURIComponent(path)}` : '';
+      const r = await fetch(`${API}/folders/browse${q}`);
+      if (!r.ok) throw new Error(await r.text());
+      const d = await r.json();
+      setLoc(d);
+      loadMarker(d.path);            // show who last worked in this folder
+    } catch (e) { setErr(String(e).replace(/^Error:\s*/, '') || 'Cannot read folder.'); }
+    setLoading(false);
+  }
+
+  async function enterAs(name) {
+    const u = (name || '').trim();
+    if (!u) return;
+    try { localStorage.setItem('haria_user', u); } catch {}
+    window.HARIA_USER = u;
+    if (onUser) onUser(u);
+    setUser(u);
+    setEntered(true);
+    let last = null;
+    try { last = (await (await fetch(`${API}/users/${encodeURIComponent(u)}/state`)).json()).last_folder; } catch {}
+    if (last) { setChosen(last); window.HARIA_FOLDER = last; loadRecents(last); }
+    browse(last || null);          // resume where they left off
+  }
+
+  // If a user is already remembered (no "who" step), load their state on mount.
+  useEffect(() => { if (entered && _cachedUser) enterAs(_cachedUser); }, []);
+
+  // Write the folder's shared marker, warning (via confirm) if it changed since
+  // we loaded it — someone else may have worked here in the meantime.
+  async function touchMarker(folder, fields) {
+    let expected = (marker && marker.path === folder) ? marker.mtime : (await loadMarker(folder)).mtime;
+    const post = (force) => fetch(`${API}/folders/marker?path=${encodeURIComponent(folder)}`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ author: user, ...fields, expected_mtime: expected, force: !!force }),
+    }).then(r => r.json());
+    let r = await post(false);
+    if (r && r.conflict) {
+      const who = (r.marker && r.marker.updated_by) || 'someone else';
+      const when = r.marker && r.marker.updated_at ? new Date(r.marker.updated_at * 1000).toLocaleString() : '';
+      if (!confirm(`This folder's session was modified by ${who}${when ? ' at ' + when : ''} since you opened it. Continue anyway?`)) return false;
+      r = await post(true);
+    }
+    if (r && r.ok) setMarker({ exists:true, mtime:r.mtime, marker:r.marker, path:folder });
+    return true;
+  }
+
+  function useThisFolder() {
+    if (!loc) return;
+    setChosen(loc.path);
+    window.HARIA_FOLDER = loc.path;
+    fetch(`${API}/users/${encodeURIComponent(user)}/state`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ last_folder: loc.path }),
+    }).catch(() => {});
+    loadRecents(loc.path);
+    touchMarker(loc.path, { working_on: (marker && marker.marker && marker.marker.working_on) || '' });
+    if (onFolder) onFolder(loc.path);
+  }
+
+  // Open a bag: stamp the working folder's marker (last session + working-on),
+  // set the active folder so recents are recorded there, then open.
+  async function openBag(path, name) {
+    const wf = chosen || (loc && loc.path) || '';
+    window.HARIA_FOLDER = wf;
+    if (wf) {
+      const ok = await touchMarker(wf, { last_session: { path, name }, working_on: name });
+      if (!ok) return;   // user declined the stale-marker warning
+      if (onFolder) onFolder(wf);
+    }
+    onOpenBag(path, name);
+  }
+
+  // A local .zip/.tar.gz — extract it in place, then open the resulting bag.
+  async function importArchive(file) {
+    setLoading(true); setErr('');
+    try {
+      const r = await fetch(`${API}/folders/import-archive?path=${encodeURIComponent(file.path)}`, { method:'POST' });
+      if (!r.ok) throw new Error(await r.text());
+      const d = await r.json();
+      setLoading(false);
+      openBag(d.path, file.name.replace(/\.(zip|tar\.gz|tgz)$/i, ''));
+    } catch (e) { setErr(String(e).replace(/^Error:\s*/, '') || 'Could not import archive.'); setLoading(false); }
+  }
+
+  const crumbs = loc ? loc.path.split('/').filter(Boolean) : [];
+  const mk = marker && marker.marker;
+
+  if (!entered) {
+    return (
+      <div style={_OB_BACKDROP} onClick={() => onClose && onClose()}>
+        <div style={{ ..._OB_CARD, height:'auto', width:'min(460px, 92vw)' }} onClick={e => e.stopPropagation()}>
+          <div style={{ display:'flex', alignItems:'center', padding:'14px 18px', borderBottom:'1px solid var(--black)' }}>
+            <div style={{ fontFamily:'var(--disp)', fontSize:24 }}>Welcome to HARIA</div>
+            <div style={{ flex:1 }} />
+            {onClose && <button className="tb-back" onClick={onClose} title="Close">×</button>}
+          </div>
+          <div style={{ padding:18 }}>
+            <div className="form-row">
+              <label>Who is working?</label>
+              <input autoFocus value={user} onChange={e => setUser(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') enterAs(user); }} placeholder="your name" />
+              <div className="hint">Remembers your folder and recent sessions.</div>
+            </div>
+            <div className="form-actions">
+              <button className="btn primary" onClick={() => enterAs(user)} disabled={!user.trim()}>Continue →</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={_OB_BACKDROP} onClick={() => onClose && onClose()}>
+     <div style={_OB_CARD} onClick={e => e.stopPropagation()}>
+      <div className="setup-header" style={{ flexShrink:0 }}>
+        <h1 style={{ fontSize:22 }}>Hi {window.HARIA_USER}</h1>
+        <div style={{ flex:1 }} />
+        <button className="btn" onClick={() => onClose && onClose()}>Done</button>
+      </div>
+      <div style={{ flex:1, display:'flex', minHeight:0 }}>
+        {/* Filesystem navigator */}
+        <div style={{ flex:1, display:'flex', flexDirection:'column', minHeight:0, borderRight:'1px solid var(--g5)' }}>
+          {/* Path bar */}
+          <div style={{ display:'flex', alignItems:'center', gap:8, padding:'8px 12px',
+                        borderBottom:'1px solid var(--g5)', fontFamily:'var(--mono)', fontSize:11, flexShrink:0 }}>
+            <button className="btn" style={{ padding:'2px 8px' }} disabled={!loc || !loc.parent}
+              onClick={() => loc && loc.parent && browse(loc.parent)} title="Up one folder">⬆ Up</button>
+            <span style={{ flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', color:'var(--g2)' }}
+              title={loc ? loc.path : ''}>{loc ? loc.path : '…'}</span>
+            <button className="btn primary" style={{ padding:'2px 10px' }} disabled={!loc}
+              onClick={useThisFolder} title="Remember this as your working folder">
+              {chosen && loc && chosen === loc.path ? '✓ Using this' : 'Use this folder'}
+            </button>
+          </div>
+          {/* Marker: who last worked in this folder / what they were on */}
+          {mk && (mk.updated_by || mk.working_on) && (
+            <div style={{ padding:'5px 12px', borderBottom:'1px solid var(--g6)', background:'var(--g6)',
+                          fontFamily:'var(--mono)', fontSize:10, color:'var(--g2)' }}>
+              🧭 Last here: <b>{mk.updated_by || '—'}</b>
+              {mk.working_on ? <> · working on <b>{mk.working_on}</b></> : null}
+              {mk.updated_at ? <span style={{ color:'var(--g3)' }}> · {new Date(mk.updated_at * 1000).toLocaleString()}</span> : null}
+            </div>
+          )}
+          {/* Entries */}
+          <div style={{ flex:1, overflow:'auto' }}>
+            {loading && <div style={{ padding:16, fontFamily:'var(--mono)', fontSize:11, color:'var(--g3)' }}>Loading…</div>}
+            {err && <div style={{ padding:16, fontFamily:'var(--mono)', fontSize:11, color:'#c0862a' }}>{err}</div>}
+            {loc && loc.is_bag_here && (
+              <div onClick={() => openBag(loc.path, crumbs[crumbs.length - 1] || loc.path)}
+                style={{ padding:'6px 12px', cursor:'pointer', fontFamily:'var(--mono)', fontSize:12,
+                         display:'flex', gap:8, background:'var(--g6)' }}>
+                <span>🤖</span><span>Open this folder as a bag</span>
+              </div>
+            )}
+            {loc && loc.entries.map(e => (
+              <div key={e.path}
+                onClick={() => e.is_bag ? openBag(e.path, e.name) : browse(e.path)}
+                title={e.path}
+                style={{ padding:'5px 12px', cursor:'pointer', fontFamily:'var(--mono)', fontSize:12,
+                         display:'flex', gap:8, alignItems:'center', opacity: (e.is_bag || e.has_bags) ? 1 : 0.6 }}>
+                <span>{e.is_bag ? '🤖' : '📁'}</span>
+                <span style={{ flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{e.name}</span>
+                {e.is_bag ? <span style={{ color:'var(--g3)', fontSize:10 }}>bag</span>
+                          : e.has_bags ? <span style={{ color:'var(--g4)', fontSize:14 }}>›</span> : null}
+              </div>
+            ))}
+            {/* Acceptable loose files in this folder (.mcap/.db3, video, .zip/.tar.gz) */}
+            {loc && (loc.files || []).map(f => (
+              <div key={f.path}
+                onClick={() => f.kind === 'archive' ? importArchive(f) : openBag(loc.path, crumbs[crumbs.length - 1] || f.name)}
+                title={f.kind === 'archive' ? 'Extract and open' : 'Open this folder as a bag'}
+                style={{ padding:'5px 12px', cursor:'pointer', fontFamily:'var(--mono)', fontSize:12,
+                         display:'flex', gap:8, alignItems:'center' }}>
+                <span>{f.kind === 'archive' ? '📦' : f.kind === 'video' ? '🎬' : '🤖'}</span>
+                <span style={{ flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{f.name}</span>
+                <span style={{ color:'var(--g3)', fontSize:10 }}>{f.kind === 'archive' ? 'import' : f.kind}</span>
+              </div>
+            ))}
+            {loc && !loc.is_bag_here && loc.entries.length === 0 && (loc.files || []).length === 0 && !loading && (
+              <div style={{ padding:16, fontFamily:'var(--mono)', fontSize:11, color:'var(--g4)' }}>
+                Nothing here to open. Acceptable: a bag folder, .mcap/.db3, video, or .zip/.tar.gz.
+              </div>
+            )}
+          </div>
+        </div>
+        {/* Right: recents */}
+        <div style={{ width:300, overflow:'auto' }}>
+          <div style={{ padding:'8px 12px', fontFamily:'var(--mono)', fontSize:10, color:'var(--g3)',
+                        letterSpacing:'0.1em', textTransform:'uppercase' }}>Recent</div>
+          {recents.length > 0 ? recents.map(r => (
+            <div key={r.path} onClick={() => openBag(r.path, r.name)} title={r.path}
+              style={{ padding:'5px 12px', cursor:'pointer', fontFamily:'var(--mono)', fontSize:12, display:'flex', gap:8 }}>
+              <span>🕘</span><span style={{ overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{r.name || r.path}</span>
+            </div>
+          )) : (
+            <div style={{ padding:'6px 12px', fontFamily:'var(--mono)', fontSize:11, color:'var(--g4)' }}>
+              {chosen ? 'No recent sessions in this folder yet.' : 'Pick a working folder to see recents.'}
+            </div>
+          )}
+        </div>
+      </div>
+     </div>
+    </div>
+  );
+}
 
 function RecordSetup({ onStart, onBack }) {
   const [name, setName]       = useState('session');
@@ -445,6 +750,7 @@ function RecordSetup({ onStart, onBack }) {
         selectedTopics = [...new Set([...checkedList, ...manual])];
       }
       const body = { name: `${name || 'session'}_${ts}`, topics: selectedTopics };
+      if (window.HARIA_FOLDER) body.dest = window.HARIA_FOLDER;   // record into the working folder
       const r = await fetch(`${API}/recordings/start`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
       if (!r.ok) throw new Error(await r.text());
       onStart('record', body.name);
@@ -463,7 +769,7 @@ function RecordSetup({ onStart, onBack }) {
           <div className="form-row">
             <label>Session Name</label>
             <input value={name} onChange={e => setName(e.target.value)} placeholder="session" />
-            <div className="hint">Saved to recordings/&lt;name&gt;_&lt;timestamp&gt; (.mcap + metadata.yaml + annotations.json)</div>
+            <div className="hint">Saved to {window.HARIA_FOLDER ? `${window.HARIA_FOLDER}/` : 'recordings/'}&lt;name&gt;_&lt;timestamp&gt; (.mcap + metadata.yaml + annotations.json)</div>
           </div>
 
           <div className="form-row">
@@ -536,29 +842,17 @@ function PlaybackUpload({ onStart, onBack, autoOpen }) {
   const [procState, setProcState]       = useState('idle');
   const [procMsg, setProcMsg]           = useState('');
   const [dragging, setDragging]         = useState(false);
-  const [recordings, setRecordings]     = useState([]);
   const [openedName, setOpenedName]     = useState('');   // session being opened, shown in the topbar
+  const [openedBag, setOpenedBag]       = useState('');   // per-bag cache key from open/upload
   const fileRef = useRef();
   const pollRef = useRef();
-
-  useEffect(() => {
-    fetch(`${API}/recordings`)
-      .then(r => r.ok ? r.json() : [])
-      .then(arr => {
-        if (!Array.isArray(arr)) return;
-        const usable = arr.filter(r => r.has_metadata || (r.mcap_files || []).length > 0);
-        usable.sort((a, b) => (b.start_time_ns || 0) - (a.start_time_ns || 0));
-        setRecordings(usable);
-      })
-      .catch(() => {});
-  }, []);
 
   function startPolling() {
     setProcState('processing'); setProcMsg('Processing bag…');
     clearInterval(pollRef.current);
     pollRef.current = setInterval(async () => {
       try {
-        const r2 = await fetch(`${API}/playback/status`);
+        const r2 = await fetch(`${API}/playback/status${window.hbag(false)}`);
         const d2 = await r2.json();
         setProcState(d2.state); setProcMsg(d2.progress || d2.error || '');
         if (d2.state === 'ready' || d2.state === 'error') clearInterval(pollRef.current);
@@ -581,21 +875,35 @@ function PlaybackUpload({ onStart, onBack, autoOpen }) {
       if (!r.ok) throw new Error(await r.text());
       const d = await r.json();
       setOpenedName((d.path || '').split('/').filter(Boolean).pop() || folder || label);
+      setOpenedBag(d.bag || ''); window.HARIA_BAG = d.bag || '';
       setUploadStatus(`Uploaded → ${d.path}${d.note ? ' · ' + d.note : ''}`); setStatusType('ok');
       startPolling();
     } catch(e) { setUploadStatus(String(e).replace(/^Error:\s*/, '')); setStatusType('err'); }
   }
 
-  async function openRecording(name) {
-    setUploadStatus(`Opening ${name}…`); setStatusType(''); setProcState('idle');
-    setOpenedName(name);
+  async function openRecording(target) {
+    // target is a recordings name (string) or a folder bag {path, name}.
+    const isPath = target && typeof target === 'object';
+    const label  = isPath ? (target.name || target.path) : target;
+    const body   = isPath ? { path: target.path } : { name: target };
+    setUploadStatus(`Opening ${label}…`); setStatusType(''); setProcState('idle');
+    setOpenedName(label);
     try {
       const r = await fetch(`${API}/playback/open`, {
         method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ name }),
+        body: JSON.stringify(body),
       });
       if (!r.ok) throw new Error(await r.text());
-      setUploadStatus(`Opened → ${name}`); setStatusType('ok');
+      const d = await r.json();
+      setOpenedBag(d.bag || ''); window.HARIA_BAG = d.bag || '';
+      // Remember it in the user's recents (best-effort).
+      if (window.HARIA_USER && window.HARIA_FOLDER) {
+        fetch(`${API}/users/${encodeURIComponent(window.HARIA_USER)}/state?folder=${encodeURIComponent(window.HARIA_FOLDER)}`, {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ recent: { bag_key: d.bag || '', path: d.path || (isPath ? target.path : ''), name: label } }),
+        }).catch(() => {});
+      }
+      setUploadStatus(`Opened → ${label}`); setStatusType('ok');
       startPolling();
     } catch(e) { setUploadStatus(String(e)); setStatusType('err'); }
   }
@@ -615,31 +923,7 @@ function PlaybackUpload({ onStart, onBack, autoOpen }) {
       </div>
       <div className="upload-body">
         <div className="upload-inner">
-          {recordings.length > 0 && (
-            <div style={{ marginBottom: 22 }}>
-              <div className="upload-title">Open a recording</div>
-              <div style={{ border:'1px solid var(--black)', maxHeight:190, overflowY:'auto' }}>
-                {recordings.map(rec => (
-                  <div key={rec.name}
-                    onClick={() => openRecording(rec.name)}
-                    style={{ display:'flex', justifyContent:'space-between', gap:12,
-                             padding:'9px 12px', cursor:'pointer',
-                             borderBottom:'1px solid var(--g5)',
-                             fontFamily:'var(--mono)', fontSize:12 }}
-                    onMouseEnter={e => e.currentTarget.style.background = 'var(--g6)'}
-                    onMouseLeave={e => e.currentTarget.style.background = ''}
-                  >
-                    <span style={{ overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{rec.name}</span>
-                    <span style={{ color:'var(--g3)', flexShrink:0 }}>
-                      {rec.duration_ns ? `${(rec.duration_ns / 1e9).toFixed(1)}s · ` : ''}
-                      {(rec.size_bytes / 1e6).toFixed(1)} MB
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-          <div className="upload-title">{recordings.length > 0 ? 'Or upload a bag' : 'Select ROS 2 bag'}</div>
+          <div className="upload-title">Select ROS 2 bag</div>
           <div className={`drop-zone${dragging ? ' drag-over' : ''}`}
             onClick={() => fileRef.current.click()}
             onDragOver={e => { e.preventDefault(); setDragging(true); }}
@@ -664,7 +948,7 @@ function PlaybackUpload({ onStart, onBack, autoOpen }) {
           {procState === 'ready'  && <div className="status-bar ok">✓ Ready to open</div>}
           <div className="form-actions">
             <button className="btn" onClick={onBack}>Cancel</button>
-            <button className="btn primary" onClick={() => onStart('playback', openedName)} disabled={procState !== 'ready'}>▶  Open Dashboard</button>
+            <button className="btn primary" onClick={() => onStart('playback', openedName, openedBag)} disabled={procState !== 'ready'}>▶  Open Dashboard</button>
           </div>
         </div>
       </div>
@@ -685,7 +969,9 @@ function Dashboard({ mode, sessionName, onStop }) {
   const [leftCollapsed, setLeftCollapsed] = useState(false);
   const [leftW, setLeftW]   = useState(() => { try { return parseInt(localStorage.getItem('haria_left_w'), 10) || 220; } catch { return 220; } });
   const [rightW, setRightW] = useState(() => { try { return parseInt(localStorage.getItem('haria_right_w'), 10) || 260; } catch { return 260; } });
-  const [author, setAuthor]             = useState(() => { try { return localStorage.getItem('haria_author') || ''; } catch { return ''; } });
+  // Default the annotation author to the onboarding user ("who is working"),
+  // falling back to a previously-used author name.
+  const [author, setAuthor]             = useState(() => { try { return window.HARIA_USER || localStorage.getItem('haria_author') || ''; } catch { return window.HARIA_USER || ''; } });
   const [askAuthor, setAskAuthor]       = useState(false);
   const [authorDraft, setAuthorDraft]   = useState('');
   const [dirty, setDirty]               = useState(false);   // unsaved annotation changes
@@ -719,7 +1005,7 @@ function Dashboard({ mode, sessionName, onStop }) {
   useEffect(() => { window.HariaResetCodebook && window.HariaResetCodebook(); }, []);
 
   useEffect(() => {
-    fetch(`${API}/session/annotations`)
+    fetch(`${API}/session/annotations${window.hbag(false)}`)
       .then(r => r.ok ? r.json() : [])
       .then(arr => {
         if (Array.isArray(arr)) { savedRef.current = JSON.stringify(arr); setAnnotations(arr); }
@@ -731,7 +1017,7 @@ function Dashboard({ mode, sessionName, onStop }) {
   // recording — we can't interrupt a live capture). Prefilled with the
   // remembered author, so it's usually one Enter.
   useEffect(() => {
-    if (mode === 'playback') { setAuthorDraft(author); setAskAuthor(true); }
+    if (mode === 'playback') { setAuthorDraft(author || window.HARIA_USER || ''); setAskAuthor(true); }
   }, []);
 
   function saveAuthor(v) {
@@ -754,7 +1040,7 @@ function Dashboard({ mode, sessionName, onStop }) {
 
   async function saveAnnotations() {
     const body = JSON.stringify(annotations);
-    const r = await fetch(`${API}/session/annotations`, {
+    const r = await fetch(`${API}/session/annotations${window.hbag(false)}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
     });
     if (!r.ok) throw new Error(await r.text());
@@ -772,7 +1058,7 @@ function Dashboard({ mode, sessionName, onStop }) {
   useEffect(() => {
     async function poll() {
       try {
-        const r = await fetch(`${API}/topics/index`);
+        const r = await fetch(`${API}/topics/index${window.hbag(false)}`);
         if (!r.ok) return;
         const d = await r.json();
         setTopicIndex(d.topics || []);
@@ -923,6 +1209,7 @@ function Dashboard({ mode, sessionName, onStop }) {
 
       <window.HariaTimelineContainer
         mode={mode}
+        onStop={handleBack}
         tStart={tStart}
         tEnd={tEnd}
         topicIndex={topicIndex}
@@ -943,6 +1230,12 @@ function App() {
   const [mode, setMode]         = useState(null);
   const [autoOpen, setAutoOpen] = useState(null);
   const [sessionName, setSessionName] = useState('');
+  // Onboarding is now an overlay. Ask "who is working" only when no user is
+  // remembered; the folder navigator opens without re-asking.
+  const [user, setUser]         = useState(() => { try { return localStorage.getItem('haria_user') || ''; } catch { return ''; } });
+  const [onboard, setOnboard]   = useState(() => { try { return !localStorage.getItem('haria_user'); } catch { return true; } });
+  const [askUser, setAskUser]   = useState(() => { try { return !localStorage.getItem('haria_user'); } catch { return true; } });
+  const [workingFolder, setWorkingFolder] = useState(() => window.HARIA_FOLDER || '');
 
   useEffect(() => { loadCategories(); }, []);
 
@@ -953,23 +1246,43 @@ function App() {
     setMode('playback');
     setScreen('playback-upload');
   }
+  function openBag(path, name) {          // open a bag from the folder tree, by path
+    window._hariaSeekTo = null;
+    setAutoOpen({ path, name });
+    setMode('playback');
+    setScreen('playback-upload');
+  }
   function goHome() { setMode(null); setAutoOpen(null); setScreen('home'); }
 
   return (
     <>
+      {onboard && (
+        <Onboarding
+          askUser={askUser}
+          onUser={(u) => setUser(u)}
+          onOpenBag={(p, n) => { setOnboard(false); openBag(p, n); }}
+          onFolder={(f) => { setWorkingFolder(f); window.HARIA_FOLDER = f; }}
+          onClose={() => setOnboard(false)}
+        />
+      )}
       {screen === 'home' && (
         <Home
+          workingFolder={workingFolder}
+          user={user}
+          onChangeUser={() => { setAskUser(true); setOnboard(true); }}
+          onChangeFolder={() => { setAskUser(false); setOnboard(true); }}
           onRecord={() => { setMode('record'); setScreen('record-setup'); }}
           onPlayback={() => { setMode('playback'); setAutoOpen(null); setScreen('playback-upload'); }}
           onAnnotations={() => setScreen('annotations')}
           onOpenRecording={openRecording}
+          onOpenBag={openBag}
         />
       )}
       {screen === 'annotations' && (
         <window.HariaAnnotationsExplorer onBack={goHome} onOpenRecording={openRecording} />
       )}
-      {screen === 'record-setup'    && <RecordSetup    onStart={(m, nm) => { setMode(m); setSessionName(nm || ''); setScreen('dashboard'); }} onBack={goHome} />}
-      {screen === 'playback-upload' && <PlaybackUpload onStart={(m, nm) => { setMode(m); setSessionName(nm || ''); setScreen('dashboard'); }} onBack={goHome} autoOpen={autoOpen} />}
+      {screen === 'record-setup'    && <RecordSetup    onStart={(m, nm) => { window.HARIA_BAG = ''; setMode(m); setSessionName(nm || ''); setScreen('dashboard'); }} onBack={goHome} />}
+      {screen === 'playback-upload' && <PlaybackUpload onStart={(m, nm, bag) => { window.HARIA_BAG = bag || ''; setMode(m); setSessionName(nm || ''); setScreen('dashboard'); }} onBack={goHome} autoOpen={autoOpen} />}
       {screen === 'dashboard'       && <Dashboard mode={mode} sessionName={sessionName} onStop={goHome} />}
     </>
   );

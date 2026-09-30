@@ -257,7 +257,7 @@ function AnnotationsExplorer({ onBack, onOpenRecording }) {
         {!loading && !err && tree.length === 0 && (
           <div style={{ padding:32, fontFamily:'var(--mono)', fontSize:11, color:'var(--g3)' }}>
             {rows.length === 0
-              ? 'No annotations found in any recording. Annotate a session in Record or Playback.'
+              ? 'No annotations found in any recording. Annotate a session in Record or Playback first.'
               : 'No annotations match the current filters.'}
           </div>
         )}

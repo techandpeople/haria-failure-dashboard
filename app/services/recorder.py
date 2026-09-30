@@ -146,7 +146,8 @@ class Recorder:
     def state(self) -> RecordingState:
         return self._state
 
-    async def start(self, topics: list[str], name: Optional[str] = None) -> RecordingState:
+    async def start(self, topics: list[str], name: Optional[str] = None,
+                    dest: Optional[str] = None) -> RecordingState:
         async with self._lock:
             if self._state.is_active:
                 raise RuntimeError("A recording is already in progress.")
@@ -157,16 +158,29 @@ class Recorder:
                     "before launching uvicorn?"
                 )
 
+            # Where the bag lands: the caller's working folder if given (and
+            # writable), otherwise the app's recordings/ dir. Confined to
+            # HARIA_ROOT only when HARIA_LOCK_ROOT is set.
+            base = RECORDINGS_DIR
+            if dest:
+                from app.config import HARIA_LOCK_ROOT, HARIA_ROOT
+                d = Path(dest).resolve()
+                if HARIA_LOCK_ROOT and HARIA_ROOT.resolve() != d and HARIA_ROOT.resolve() not in d.parents:
+                    raise RuntimeError("Destination folder is outside the allowed root.")
+                if not d.is_dir():
+                    raise RuntimeError(f"Destination folder does not exist: {d}")
+                base = d
+
             # Disk-space guard.
-            free = shutil.disk_usage(RECORDINGS_DIR).free
+            free = shutil.disk_usage(base).free
             if free < MIN_FREE_BYTES:
                 raise RuntimeError(
                     f"Refusing to start recording: only {free / 1e9:.1f} GB free on "
-                    f"{RECORDINGS_DIR} (minimum {MIN_FREE_BYTES / 1e9:.1f} GB)."
+                    f"{base} (minimum {MIN_FREE_BYTES / 1e9:.1f} GB)."
                 )
 
             bag_name = _sanitize_name(name) if name else datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            bag_path = RECORDINGS_DIR / bag_name
+            bag_path = base / bag_name
 
             if bag_path.exists():
                 raise RuntimeError(f"A recording named {bag_name!r} already exists.")

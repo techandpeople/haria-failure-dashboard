@@ -7,7 +7,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import FRONTEND_DIR
 from app.ros_manager import ros_manager
-from app.routers import health, recordings, session, topics
+from app.routers import folders, health, recordings, session, topics
 from app.services import live_capture
 from app.services.recorder import recorder
 
@@ -42,6 +42,7 @@ app.include_router(health.router)
 app.include_router(topics.router)
 app.include_router(recordings.router)
 app.include_router(session.router)
+app.include_router(folders.router)
 
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR / "static"), name="static")
 

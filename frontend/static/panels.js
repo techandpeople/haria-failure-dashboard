@@ -299,7 +299,7 @@ function VideoBody({ slug, currentTime }) {
     for (const v of cache.current.values()) if (v && v !== 'pending' && v.close) v.close();
     cache.current.clear();
     setReady(false);
-    fetch(`${_API}/topics/frames/${slug}`)
+    fetch(`${_API}/topics/frames/${slug}${window.hbag(false)}`)
       .then(r => r.ok ? r.json() : null)
       .then(d => { if (alive && d && Array.isArray(d.frames)) setFrames(d.frames); })
       .catch(() => {});
@@ -309,7 +309,7 @@ function VideoBody({ slug, currentTime }) {
   useEffect(() => {
     if (!frames || !frames.length) return;
     const c = cache.current;
-    const url = i => `${_API}/topics/image/${slug}?frame=${frames[i].toFixed(3)}`;
+    const url = i => `${_API}/topics/image/${slug}?frame=${frames[i].toFixed(3)}${window.hbag(true)}`;
     // Fetch + decode a frame off the main thread; store the bitmap when ready.
     const ensure = i => {
       const k = frames[i].toFixed(3);
@@ -444,7 +444,7 @@ function VideoFileBody({ slug, topicMeta, currentTime }) {
 
   return (
     <>
-      <video ref={ref} className="panel-image" src={`${_API}/topics/video/${slug}`}
+      <video ref={ref} className="panel-image" src={`${_API}/topics/video/${slug}${window.hbag(false)}`}
         playsInline preload="auto"
         style={{ opacity: past ? 0.25 : 1 }}
         onLoadedMetadata={e => {
@@ -498,7 +498,7 @@ function AudioBody({ slug, currentTime }) {
   useEffect(() => {
     let alive = true;
     const tick = () => {
-      fetch(`${_API}/topics/index`)
+      fetch(`${_API}/topics/index${window.hbag(false)}`)
         .then(r => r.ok ? r.json() : null)
         .then(d => {
           if (!alive || !d) return;
@@ -525,7 +525,7 @@ function AudioBody({ slug, currentTime }) {
   useEffect(() => {
     let alive = true;
     if (state !== 'ready') setState('loading');
-    fetch(`${_API}/topics/audio/${slug}`)
+    fetch(`${_API}/topics/audio/${slug}${window.hbag(false)}`)
       .then(r => { if (!r.ok) throw new Error('no audio'); return r.arrayBuffer(); })
       .then(buf => {
         const AC = window.AudioContext || window.webkitAudioContext;
@@ -612,7 +612,7 @@ function AudioBody({ slug, currentTime }) {
     <div style={{ display:'flex', flexDirection:'column', height:'100%', padding:8, gap:6 }}>
       {recBadge}
       <canvas ref={canvasRef} style={{ width:'100%', height:60, background:'var(--g6)' }} />
-      <audio ref={audioRef} src={`${_API}/topics/audio/${slug}`} controls style={{ width:'100%' }} />
+      <audio ref={audioRef} src={`${_API}/topics/audio/${slug}${window.hbag(false)}`} controls style={{ width:'100%' }} />
       <div style={{ fontFamily:'var(--mono)', fontSize:9, color:'var(--g3)' }}>
         {live ? 'Live capture — waveform grows as audio arrives'
               : state === 'loading' ? 'Decoding waveform…' : 'Follows the timeline · use controls to scrub freely'}
@@ -631,7 +631,7 @@ function TFBody({ slug, currentTime }) {
   const [err] = useState(window.THREE ? '' : 'three.js failed to load');
 
   useEffect(() => {
-    fetch(`${_API}/topics/data/tf_static?t=1e12&window=1e12&raw=0`)
+    fetch(`${_API}/topics/data/tf_static?t=1e12&window=1e12&raw=0${window.hbag(true)}`)
       .then(r => r.ok ? r.json() : null)
       .then(d => {
         const tf = {};
@@ -700,7 +700,7 @@ function TFBody({ slug, currentTime }) {
     if (tfAbort.current) tfAbort.current.abort();
     const ctrl = new AbortController();
     tfAbort.current = ctrl;
-    fetch(`${_API}/topics/data/${slug}?t=${currentTime}&window=5&raw=0`, { signal: ctrl.signal })
+    fetch(`${_API}/topics/data/${slug}?t=${currentTime}&window=5&raw=0${window.hbag(true)}`, { signal: ctrl.signal })
       .then(r => r.ok ? r.json() : null)
       .then(d => {
         if (ctrl.signal.aborted) return;
@@ -797,7 +797,7 @@ function Panel({ panel, topicMeta, onClose, onBringToFront, zIndex, currentTime 
       // video / audio / 3d fetch their own data in dedicated sub-components
     } else if (panelType === 'image') {
       const t = currentTime !== null ? `?t=${currentTime}&ts=${now}` : `?ts=${now}`;
-      setImgSrc(`${_API}/topics/image/${panel.slug}${t}`);
+      setImgSrc(`${_API}/topics/image/${panel.slug}${t}${window.hbag(true)}`);
     } else {
       // Charts and 2D plots need the numeric fields of the whole window but
       // not the heavy _raw payloads; JSON/table need _raw but only the newest.
@@ -806,7 +806,7 @@ function Panel({ panel, topicMeta, onClose, onBringToFront, zIndex, currentTime 
       if (abortRef.current) abortRef.current.abort();
       const ctrl = new AbortController();
       abortRef.current = ctrl;
-      fetch(`${_API}/topics/data/${panel.slug}${q}`, { signal: ctrl.signal })
+      fetch(`${_API}/topics/data/${panel.slug}${q}${window.hbag(!!q)}`, { signal: ctrl.signal })
         .then(r => r.ok ? r.json() : null)
         .then(d => d && setData(d))
         .catch(() => {});

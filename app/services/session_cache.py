@@ -52,10 +52,18 @@ class SessionCache:
         self._data: dict[str, _TopicData] = {}
         self._frames: dict[str, _FrameIndex] = {}
 
-    def invalidate(self) -> None:
+    def invalidate(self, prefix: Optional[str] = None) -> None:
+        """Drop cached entries. With a path prefix, drop only entries under that
+        directory (keys are file paths), so rebuilding one bag doesn't clear the
+        in-memory caches of other bags open in concurrent sessions."""
         with self._lock:
-            self._data.clear()
-            self._frames.clear()
+            if prefix is None:
+                self._data.clear()
+                self._frames.clear()
+                return
+            for store in (self._data, self._frames):
+                for k in [k for k in store if k.startswith(prefix)]:
+                    store.pop(k, None)
 
     # -- windowed data -------------------------------------------------------
 
@@ -63,16 +71,19 @@ class SessionCache:
         """Entries with lo_t <= t <= hi_t, parsing only bytes appended since
         the previous call. Entries are appended in time order by both the
         indexer and the live-capture node."""
+        # Key by the file path, not the bare slug, so the same slug in two
+        # different bag caches (multi-session) never collide.
+        key = str(jsonl)
         with self._lock:
             try:
                 st = jsonl.stat()
             except FileNotFoundError:
-                self._data.pop(slug, None)
+                self._data.pop(key, None)
                 return []
 
-            c = self._data.get(slug)
+            c = self._data.get(key)
             if c is None or st.st_ino != c.ino or st.st_size < c.offset:
-                c = self._data[slug] = _TopicData(ino=st.st_ino)
+                c = self._data[key] = _TopicData(ino=st.st_ino)
 
             if st.st_size > c.offset:
                 with jsonl.open("rb") as f:
@@ -101,13 +112,15 @@ class SessionCache:
 
     def _frame_index(self, tdir: Path, slug: str) -> Optional[_FrameIndex]:
         """Return the cached frame index, rescanning only when mtime changes."""
+        # Key by the directory path, not the bare slug (multi-session safe).
+        key = str(tdir)
         try:
             mt = tdir.stat().st_mtime_ns
         except FileNotFoundError:
-            self._frames.pop(slug, None)
+            self._frames.pop(key, None)
             return None
 
-        c = self._frames.get(slug)
+        c = self._frames.get(key)
         now = time.monotonic()
         # Live recording bumps mtime constantly; reuse the index until the
         # rescan interval elapses instead of re-globbing on every poll.
@@ -123,7 +136,7 @@ class SessionCache:
                 except ValueError:
                     continue
             pairs.sort()
-            c = self._frames[slug] = _FrameIndex(
+            c = self._frames[key] = _FrameIndex(
                 mtime_ns=mt,
                 ts=[p[0] for p in pairs],
                 names=[p[1] for p in pairs],

@@ -38,6 +38,7 @@ class StartRequest(BaseModel):
                               description="Topics to record; empty = record all",
                               examples=[["/chatter", "/tf"]])
     name: Optional[str] = Field(None, description="Optional bag folder name")
+    dest: Optional[str] = Field(None, description="Working folder to record into (defaults to recordings/)")
 
 
 class StatusResponse(BaseModel):
@@ -65,7 +66,7 @@ async def status():
 @router.post("/start", response_model=StatusResponse)
 async def start(req: StartRequest):
     try:
-        s = await recorder.start(req.topics, name=req.name)
+        s = await recorder.start(req.topics, name=req.name, dest=req.dest)
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
@@ -246,8 +247,8 @@ def get_annotations(name: str):
 def save_annotations(name: str, annotations: list[dict]):
     bag_path = _bag_dir(name)
     ann_file = bag_path / "annotations.json"
-    # Atomic (see session_state.save_annotations): a truncating write that dies
-    # halfway loses every annotation for this recording.
+    # Atomic write: a truncating write that dies halfway would lose every
+    # annotation for this recording, so write a temp file then rename over it.
     tmp = ann_file.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(annotations, indent=2), encoding="utf-8")
     tmp.replace(ann_file)

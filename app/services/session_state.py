@@ -7,7 +7,6 @@ metadata.yaml, so they travel with the recording.
 """
 from __future__ import annotations
 
-import json
 import threading
 from pathlib import Path
 from typing import Optional
@@ -28,41 +27,14 @@ class SessionState:
         with self._lock:
             self.status["progress"] = progress
 
-    # -- bag / annotations ---------------------------------------------------
+    # -- bag ----------------------------------------------------------------
+    # Annotation read/write now lives in the session router keyed per bag
+    # (app/routers/session.py:_annotations_file), so the dashboard is
+    # multi-session safe; this class only tracks the legacy "current" bag and
+    # the single-slot processing status used as a fallback.
     def set_bag(self, path: Optional[Path]) -> None:
         with self._lock:
             self.bag_path = path
-
-    def annotations_file(self) -> Optional[Path]:
-        with self._lock:
-            if self.bag_path is None:
-                return None
-            return self.bag_path / "annotations.json"
-
-    def load_annotations(self) -> list:
-        f = self.annotations_file()
-        if f is None or not f.exists():
-            return []
-        try:
-            return json.loads(f.read_text())
-        except json.JSONDecodeError:
-            return []
-
-    def save_annotations(self, annotations: list) -> Path:
-        f = self.annotations_file()
-        if f is None:
-            raise RuntimeError("No active session bag to attach annotations to.")
-        # Never create the bag dir ourselves — `ros2 bag record -o` fails if
-        # its output directory already exists.
-        if not f.parent.exists():
-            raise RuntimeError(f"Bag directory {f.parent} does not exist yet.")
-        # Atomic: write a sibling temp file then rename over the target. A plain
-        # write_text truncates first, so a crash or full disk mid-write would
-        # leave a truncated annotations.json — losing the session's work.
-        tmp = f.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(annotations, indent=2), encoding="utf-8")
-        tmp.replace(f)
-        return f
 
 
 session = SessionState()
