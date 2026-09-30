@@ -1,0 +1,982 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HARIA Failure Dashboard</title>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Bebas+Neue&family=DM+Sans:wght@300;400;500;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<!-- three.js for the 3D/TF panel (loaded lazily-ish; panel degrades if absent) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>window.HARIA_API = '';  /* same origin — the backend serves this page */</script>
+<script src="/static/sidebar.js"  type="text/babel" data-presets="react"></script>
+<script src="/static/panels.js"   type="text/babel" data-presets="react"></script>
+<script src="/static/timeline.js" type="text/babel" data-presets="react"></script>
+<script src="/static/explorer.js" type="text/babel" data-presets="react"></script>
+
+<script type="text/babel" data-presets="react">
+(function () {
+const { useState, useEffect, useRef } = React;
+const API = window.HARIA_API;
+
+// ── Annotation categories (shared) ────────────────────────────────────
+// Loaded once from the backend; timeline/panels/explorer read the window
+// globals so every surface colors annotations consistently.
+window.HARIA_ANN_CATEGORIES = [];
+// Session-only codebook categories (uploaded during a playback session, never
+// persisted): [{id, label, color, labels:[...]}]. Cleared when a session opens.
+window.HARIA_CODEBOOK = [];
+function _catRecord(categoryId) {
+  return (window.HARIA_ANN_CATEGORIES || []).find(c => c.id === categoryId)
+      || (window.HARIA_CODEBOOK || []).find(c => c.id === categoryId);
+}
+window.HariaCatColor = function (categoryId) {
+  const c = _catRecord(categoryId);
+  return c ? c.color : null;
+};
+window.HariaCatLabel = function (categoryId) {
+  const c = _catRecord(categoryId);
+  return c ? c.label : (categoryId || '');
+};
+// Annotations copy their category's display label/colour at creation time so
+// they stay self-contained — a codebook (which is never persisted) not being
+// loaded later can't turn a category into a raw id. Prefer the copied value,
+// fall back to a live category lookup for older annotations.
+window.HariaAnnCatLabel = function (ann) {
+  if (ann && ann.category_label) return ann.category_label;
+  return ann && ann.category ? window.HariaCatLabel(ann.category) : null;
+};
+window.HariaAnnCatColor = function (ann) {
+  if (ann && ann.category_color) return ann.category_color;
+  return ann && ann.category ? window.HariaCatColor(ann.category) : null;
+};
+async function loadCategories() {
+  try {
+    const r = await fetch(`${API}/recordings/annotations/categories`);
+    if (r.ok) {
+      const d = await r.json();
+      if (Array.isArray(d)) window.HARIA_ANN_CATEGORIES = d;
+    }
+  } catch {}
+}
+window.HariaAddCategory = async function (label, color) {
+  const r = await fetch(`${API}/recordings/annotations/categories`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ label, color }),
+  });
+  if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`);
+  const d = await r.json();
+  if (Array.isArray(d)) window.HARIA_ANN_CATEGORIES = d;
+  return window.HARIA_ANN_CATEGORIES;
+};
+
+// Map a codebook label (case-insensitive) to the session category that owns it,
+// so the add-annotation popup can auto-select the category when a label is chosen.
+window.HariaLabelCategory = function (label) {
+  const q = (label || '').trim().toLowerCase();
+  if (!q) return null;
+  for (const c of window.HARIA_CODEBOOK || []) {
+    if ((c.labels || []).some(l => String(l.name).toLowerCase() === q)) return c.id;
+  }
+  return null;
+};
+
+// ── Codebook parsing + import ─────────────────────────────────────────
+// A codebook is a set of categories, each with predefined labels. It is used
+// only to guide annotation during a single playback session: parsed in the
+// browser (JSON or CSV) into the in-memory window.HARIA_CODEBOOK, never sent to
+// the server or persisted. Only the annotations themselves are saved/exported.
+// A codebook label is {name, description}. Descriptions are optional and come
+// from a CSV column after the label or a JSON field on the label object.
+function _normLabel(l) {
+  if (l == null) return null;
+  if (typeof l === 'string') { const n = l.trim(); return n ? { name: n, description: '' } : null; }
+  if (typeof l === 'object') {
+    const name = String(l.name ?? l.label ?? l.code ?? l.value ?? '').trim();
+    const description = String(l.description ?? l.desc ?? l.definition ?? l.meaning ?? '').trim();
+    return name ? { name, description } : null;
+  }
+  return null;
+}
+function parseCodebook(text, filename) {
+  const name = (filename || '').toLowerCase();
+  const looksJson = name.endsWith('.json') || /^\s*[\[{]/.test(text);
+  const cats = looksJson ? parseCodebookJson(text) : parseCodebookCsv(text);
+  const cleaned = cats
+    .map(c => {
+      const seen = new Set();
+      const labels = [];
+      for (const raw of (c.labels || [])) {
+        const nl = _normLabel(raw);
+        if (nl && !seen.has(nl.name.toLowerCase())) { seen.add(nl.name.toLowerCase()); labels.push(nl); }
+      }
+      return { label: (c.label || '').trim(), labels };
+    })
+    .filter(c => c.label);
+  if (!cleaned.length) throw new Error('No categories found in the codebook.');
+  return cleaned;
+}
+function parseCodebookJson(text) {
+  const data = JSON.parse(text);
+  // Accept: {categories:[{label,labels}]}, [{category|label|name, labels|codes}],
+  // or a plain map {CategoryName: ["label", ...]}.
+  const arr = Array.isArray(data) ? data
+            : Array.isArray(data.categories) ? data.categories
+            : null;
+  if (arr) {
+    return arr.map(c => {
+      // The labels list may be under labels/codes/values, or under a singular
+      // "label" when it holds an array. The category name is category/name, or
+      // a string "label" (only when "label" isn't the array of labels).
+      let labels = c.labels || c.codes || c.values;
+      if (labels == null && Array.isArray(c.label)) labels = c.label;
+      const label = c.category || c.name || (typeof c.label === 'string' ? c.label : '') || '';
+      return { label, labels: labels || [] };
+    });
+  }
+  if (data && typeof data === 'object') {
+    return Object.entries(data).map(([label, labels]) => ({
+      label, labels: Array.isArray(labels) ? labels : [labels],
+    }));
+  }
+  throw new Error('Unrecognised codebook JSON shape.');
+}
+function parseCodebookCsv(text) {
+  // Columns per row: category, label, description…  (description spans any
+  // trailing columns). Accepted shapes (mixable):
+  //   category,label,description   category with one code + description per row
+  //   category,label               category with one code (no description)
+  //   category                     a category on its own row, then its codes on
+  //   ,label,description             following rows with a blank first column
+  const rows = text.split(/\r?\n/).map(r => r.trim()).filter(Boolean)
+    .map(r => r.split(',').map(c => c.trim().replace(/^"|"$/g, '')));
+  if (!rows.length) return [];
+  // Skip a header row like "category,label,description".
+  if ((rows[0][0] || '').toLowerCase() === 'category') rows.shift();
+  const byCat = new Map();
+  const ensure = cat => { if (!byCat.has(cat)) byCat.set(cat, []); return byCat.get(cat); };
+  let current = null;
+  for (const cells of rows) {
+    const first = (cells[0] || '').trim();
+    const rest  = cells.slice(1).map(c => c.trim());
+    if (first) current = first;              // a category (maybe with a code on the same row)
+    const name = (rest.shift() || '').trim();  // the label/code
+    const description = rest.filter(Boolean).join(', ');
+    if (current && name) ensure(current).push({ name, description });
+    else if (current) ensure(current);       // bare category row: register it
+  }
+  return [...byCat.entries()].map(([label, labels]) => ({ label, labels }));
+}
+// Colours auto-assigned to codebook categories (codebooks carry no colour).
+const _CODEBOOK_PALETTE = [
+  '#e8554e', '#3fb27f', '#f5a623', '#9b6dff', '#5b8def',
+  '#e267a8', '#3fb0b2', '#c0653b', '#7a8b3f', '#8a6d3b',
+];
+function _catSlug(s) {
+  return String(s || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+}
+// Merge a parsed codebook into the in-memory session codebook. Reuses a
+// persistent category's colour when the codebook names an existing category id;
+// otherwise assigns a palette colour. Purely client-side — nothing is saved.
+window.HariaImportCodebook = function (text, filename) {
+  const parsed = parseCodebook(text, filename);
+  const cb = (window.HARIA_CODEBOOK || []).map(c => ({ ...c, labels: (c.labels || []).map(l => ({ ...l })) }));
+  const byId = new Map(cb.map(c => [c.id, c]));
+  const used = new Set([...(window.HARIA_ANN_CATEGORIES || []).map(c => c.color), ...cb.map(c => c.color)]);
+  const pick = () => {
+    for (const col of _CODEBOOK_PALETTE) if (!used.has(col)) { used.add(col); return col; }
+    return _CODEBOOK_PALETTE[used.size % _CODEBOOK_PALETTE.length];
+  };
+  for (const pc of parsed) {
+    const id = _catSlug(pc.label);
+    if (!id) continue;
+    let c = byId.get(id);
+    if (!c) {
+      const persistent = (window.HARIA_ANN_CATEGORIES || []).find(x => x.id === id);
+      c = { id, label: pc.label, color: persistent ? persistent.color : pick(), labels: [] };
+      byId.set(id, c);
+      cb.push(c);
+    }
+    const byName = new Map(c.labels.map(l => [l.name.toLowerCase(), l]));
+    for (const lbl of pc.labels) {   // pc.labels are normalized {name, description}
+      const key = lbl.name.toLowerCase();
+      const existing = byName.get(key);
+      if (!existing) { c.labels.push(lbl); byName.set(key, lbl); }
+      else if (!existing.description && lbl.description) existing.description = lbl.description;
+    }
+  }
+  window.HARIA_CODEBOOK = cb;
+  return cb;
+};
+// A new session must not inherit the previous session's codebook.
+window.HariaResetCodebook = function () { window.HARIA_CODEBOOK = []; };
+
+// ── Home ──────────────────────────────────────────────────────────────
+function Home({ onRecord, onPlayback, onAnnotations, onOpenRecording }) {
+  const [recordings, setRecordings] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  // Height of the cards grid in px; null = natural height. Persisted so the
+  // chosen split between cards and the recordings list survives reloads.
+  const [cardsH, setCardsH] = useState(() => {
+    const v = parseInt(localStorage.getItem('haria_home_split') || '', 10);
+    return Number.isFinite(v) ? v : null;
+  });
+  const cardsRef = useRef();
+
+  function onDividerDown(e) {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startH = cardsRef.current ? cardsRef.current.getBoundingClientRect().height : 0;
+    function onMove(e2) {
+      const h = Math.round(Math.max(64, Math.min(window.innerHeight * 0.7, startH + e2.clientY - startY)));
+      setCardsH(h);
+      localStorage.setItem('haria_home_split', String(h));
+    }
+    function onUp() {
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }
+
+  function resetDivider() {
+    setCardsH(null);
+    localStorage.removeItem('haria_home_split');
+  }
+
+  useEffect(() => {
+    fetch(`${API}/recordings`)
+      .then(r => r.ok ? r.json() : [])
+      .then(arr => {
+        if (!Array.isArray(arr)) return;
+        const usable = arr.filter(r => r.has_metadata || (r.mcap_files || []).length > 0);
+        usable.sort((a, b) => (b.start_time_ns || 0) - (a.start_time_ns || 0));
+        setRecordings(usable);
+      })
+      .catch(() => {})
+      .finally(() => setLoaded(true));
+  }, []);
+
+  function fmtDate(ns) {
+    if (!ns) return '—';
+    const d = new Date(ns / 1e6);
+    return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+  }
+
+  return (
+    <div className="mode-screen fade-in">
+      <div className="mode-top">
+        <div className="brand">HARIA</div>
+        <div className="brand-sub">Failure Dashboard · ROS 2 Jazzy</div>
+      </div>
+      <div style={{ display:'flex', flexDirection:'column', overflow:'hidden' }}>
+        <div className="mode-cards" ref={cardsRef}
+             style={{ gridTemplateColumns:'1fr 1fr 1fr', flexShrink:0,
+                      height: cardsH != null ? cardsH : 'auto', overflow:'hidden' }}>
+          <div className="mode-card" style={{ padding:'34px 40px' }} onClick={onRecord}>
+            <div className="card-num">01 / RECORD</div>
+            <div className="card-line" />
+            <div className="card-title">Record</div>
+            <div className="card-desc">Capture live ROS 2 topics to a new .mcap recording, with live scrubbing and annotation.</div>
+          </div>
+          <div className="mode-card" style={{ padding:'34px 40px' }} onClick={onPlayback}>
+            <div className="card-num">02 / PLAYBACK</div>
+            <div className="card-line" />
+            <div className="card-title">Playback</div>
+            <div className="card-desc">Upload an external bag, or open a local recording from the list below.</div>
+          </div>
+          <div className="mode-card" style={{ padding:'34px 40px' }} onClick={onAnnotations}>
+            <div className="card-num">03 / ANNOTATIONS</div>
+            <div className="card-line" />
+            <div className="card-title">Annotations</div>
+            <div className="card-desc">Search every annotations.json across recordings — group by name, count occurrences, jump to the moment.</div>
+          </div>
+        </div>
+
+        {/* Draggable divider — drag to resize the split, double-click to reset */}
+        <div
+          onMouseDown={onDividerDown}
+          onDoubleClick={resetDivider}
+          title="Drag to resize · double-click to reset"
+          style={{ height:10, flexShrink:0, cursor:'ns-resize', borderTop:'2px solid var(--black)',
+                   display:'flex', alignItems:'center', justifyContent:'center', userSelect:'none' }}
+          onMouseEnter={e => e.currentTarget.style.background = 'var(--g6)'}
+          onMouseLeave={e => e.currentTarget.style.background = ''}
+        >
+          <div style={{ width:36, height:3, background:'var(--g4)' }} />
+        </div>
+
+        {/* Local recordings */}
+        <div style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden', minHeight:0 }}>
+          <div style={{ padding:'12px 48px', borderBottom:'1px solid var(--black)', fontFamily:'var(--mono)',
+                        fontSize:9, letterSpacing:'0.2em', textTransform:'uppercase', color:'var(--g3)',
+                        display:'flex', justifyContent:'space-between' }}>
+            <span>Local recordings</span>
+            <span>{recordings.length}</span>
+          </div>
+          <div style={{ flex:1, overflowY:'auto' }}>
+            {loaded && recordings.length === 0 && (
+              <div style={{ padding:'24px 48px', fontFamily:'var(--mono)', fontSize:11, color:'var(--g3)' }}>
+                No recordings yet — start with 01 / Record.
+              </div>
+            )}
+            {recordings.map(rec => (
+              <div key={rec.name}
+                onClick={() => onOpenRecording(rec.name)}
+                title="Open in playback"
+                style={{ display:'flex', alignItems:'baseline', gap:18, padding:'10px 48px', cursor:'pointer',
+                         borderBottom:'1px solid var(--g5)', fontFamily:'var(--mono)', fontSize:12 }}
+                onMouseEnter={e => e.currentTarget.style.background = 'var(--g6)'}
+                onMouseLeave={e => e.currentTarget.style.background = ''}
+              >
+                <span style={{ flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{rec.name}</span>
+                <span style={{ color:'var(--g3)', fontSize:10 }}>{fmtDate(rec.start_time_ns)}</span>
+                <span style={{ color:'var(--g3)', fontSize:10, width:70, textAlign:'right' }}>
+                  {rec.duration_ns ? `${(rec.duration_ns / 1e9).toFixed(1)}s` : '—'}
+                </span>
+                <span style={{ color:'var(--g3)', fontSize:10, width:78, textAlign:'right' }}>
+                  {(rec.size_bytes / 1e6).toFixed(1)} MB
+                </span>
+                <span style={{ color:'var(--g3)', fontSize:10, width:56, textAlign:'right' }}>
+                  {rec.annotation_count != null ? `${rec.annotation_count} ann` : ''}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+      <div className="mode-bottom">
+        <div className="ver">HARIA Failure Dashboard · v2.1</div>
+        <div className="ver">ROS 2 Jazzy · Universal Topic Viewer</div>
+      </div>
+    </div>
+  );
+}
+
+// ── Record Setup ──────────────────────────────────────────────────────
+function _topicGroup(types) {
+  const t = (types && types[0]) || '';
+  if (/CompressedImage|\bImage\b/.test(t)) return 'Cameras';
+  if (/Audio|audio_common/i.test(t))       return 'Microphones';
+  if (/PointCloud|LaserScan|Range|Imu/.test(t)) return 'Sensors';
+  return 'Other';
+}
+const _GROUP_ORDER = ['Cameras', 'Microphones', 'Sensors', 'Other'];
+const _GROUP_ICON  = { Cameras:'🎥', Microphones:'🎙', Sensors:'📡', Other:'🔧' };
+
+function RecordSetup({ onStart, onBack }) {
+  const [name, setName]       = useState('session');
+  const [topics, setTopics]   = useState('');          // manual fallback for undiscovered topics
+  const [available, setAvailable] = useState([]);      // [{name, types}]
+  const [checked, setChecked] = useState(null);        // Set<string> | null (null until first load)
+  const [discovering, setDiscovering] = useState(true);
+  const [discoverErr, setDiscoverErr] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [err, setErr]         = useState('');
+
+  async function discover() {
+    setDiscovering(true); setDiscoverErr('');
+    try {
+      const r = await fetch(`${API}/topics/live`);
+      if (!r.ok) throw new Error(await r.text());
+      const arr = await r.json();
+      const list = (Array.isArray(arr) ? arr : [])
+        .filter(t => t && t.name && !['/parameter_events','/rosout','/clock'].includes(t.name))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      setAvailable(list);
+      // Preserve any prior selections; default new topics to checked (record all).
+      setChecked(prev => {
+        const next = new Set(list.map(t => t.name));
+        if (prev) for (const n of next) if (!prev.has(n) && available.some(t => t.name === n)) next.delete(n);
+        return next;
+      });
+    } catch (e) {
+      setDiscoverErr(String(e).replace(/^Error:\s*/, ''));
+      setAvailable([]);
+    }
+    setDiscovering(false);
+  }
+  useEffect(() => { discover(); }, []);
+
+  function toggle(topicName) {
+    setChecked(prev => {
+      const next = new Set(prev || []);
+      if (next.has(topicName)) next.delete(topicName); else next.add(topicName);
+      return next;
+    });
+  }
+  function setAll(on) {
+    setChecked(on ? new Set(available.map(t => t.name)) : new Set());
+  }
+
+  const chk = checked || new Set();
+  const selectedCount = available.filter(t => chk.has(t.name)).length;
+  const allSelected   = available.length > 0 && selectedCount === available.length;
+
+  // Group discovered topics for display.
+  const groups = {};
+  for (const t of available) (groups[_topicGroup(t.types)] ||= []).push(t);
+  const orderedGroups = _GROUP_ORDER.filter(g => groups[g]);
+
+  async function start() {
+    setLoading(true); setErr('');
+    try {
+      const ts   = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const manual = topics.trim() ? topics.trim().split(/[\s\n]+/).filter(Boolean) : [];
+      const checkedList = available.filter(t => chk.has(t.name)).map(t => t.name);
+      // Record-all is preserved: when every discovered topic is selected and no
+      // extra manual topics are named, send [] so the backend uses `-a` and also
+      // captures topics that appear after recording starts. A partial selection
+      // (or manual extras) records exactly that union.
+      let selectedTopics;
+      if (!available.length) {
+        selectedTopics = manual;                       // discovery unavailable → manual only
+      } else if (allSelected && !manual.length) {
+        selectedTopics = [];                           // record everything (-a)
+      } else {
+        selectedTopics = [...new Set([...checkedList, ...manual])];
+      }
+      const body = { name: `${name || 'session'}_${ts}`, topics: selectedTopics };
+      const r = await fetch(`${API}/recordings/start`, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
+      if (!r.ok) throw new Error(await r.text());
+      onStart('record', body.name);
+    } catch(e) { setErr(String(e)); }
+    setLoading(false);
+  }
+
+  return (
+    <div className="setup-screen fade-in">
+      <div className="setup-header">
+        <button className="back-btn" onClick={onBack}>← Back</button>
+        <h1>Configure Recording</h1>
+      </div>
+      <div className="setup-body">
+        <div className="setup-form">
+          <div className="form-row">
+            <label>Session Name</label>
+            <input value={name} onChange={e => setName(e.target.value)} placeholder="session" />
+            <div className="hint">Saved to recordings/&lt;name&gt;_&lt;timestamp&gt; (.mcap + metadata.yaml + annotations.json)</div>
+          </div>
+
+          <div className="form-row">
+            <label style={{display:'flex', alignItems:'center', gap:8, justifyContent:'space-between'}}>
+              <span>Topics to record</span>
+              <span style={{display:'flex', gap:6}}>
+                <button type="button" className="btn" style={{padding:'2px 8px', fontSize:12}} onClick={() => setAll(true)}  disabled={!available.length}>All</button>
+                <button type="button" className="btn" style={{padding:'2px 8px', fontSize:12}} onClick={() => setAll(false)} disabled={!available.length}>None</button>
+                <button type="button" className="btn" style={{padding:'2px 8px', fontSize:12}} onClick={discover} disabled={discovering}>{discovering ? '…' : '⟳'}</button>
+              </span>
+            </label>
+
+            {discovering && <div className="hint">Discovering live topics…</div>}
+            {!discovering && discoverErr && (
+              <div className="hint" style={{color:'#c0862a'}}>
+                Couldn't reach topic discovery ({discoverErr}). Use the box below to name topics manually, or leave it blank to record everything.
+              </div>
+            )}
+            {!discovering && !discoverErr && !available.length && (
+              <div className="hint">No live topics visible yet. Everything will be recorded once it appears — or name topics manually below.</div>
+            )}
+
+            {available.length > 0 && (
+              <div style={{border:'1px solid var(--border, #333)', borderRadius:6, maxHeight:260, overflowY:'auto', padding:'6px 4px', margin:'4px 0'}}>
+                {orderedGroups.map(g => (
+                  <div key={g} style={{marginBottom:6}}>
+                    <div style={{fontSize:11, textTransform:'uppercase', letterSpacing:'.05em', opacity:.6, padding:'2px 8px'}}>{_GROUP_ICON[g]} {g}</div>
+                    {groups[g].map(t => (
+                      <label key={t.name} style={{display:'flex', alignItems:'center', gap:8, padding:'3px 8px', cursor:'pointer', fontSize:13}}>
+                        <input type="checkbox" checked={chk.has(t.name)} onChange={() => toggle(t.name)} />
+                        <span style={{flex:1, fontFamily:'monospace'}}>{t.name}</span>
+                        <span style={{opacity:.45, fontSize:11}}>{(t.types && t.types[0] || '').split('/').pop()}</span>
+                      </label>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="hint">
+              {available.length > 0
+                ? (allSelected
+                    ? `All ${available.length} topics selected — recording everything (plus any that appear later).`
+                    : `${selectedCount} of ${available.length} topics selected.`)
+                : 'Blank = subscribe to everything.'}
+            </div>
+          </div>
+
+          <div className="form-row">
+            <label>Additional topics (optional)</label>
+            <textarea value={topics} onChange={e => setTopics(e.target.value)} placeholder={"/topic_not_yet_visible"} style={{minHeight:52}} />
+            <div className="hint">One per line — for topics not yet discovered above. Added to the selection.</div>
+          </div>
+
+          {err && <div className="err-row">{err}</div>}
+          <div className="form-actions">
+            <button className="btn" onClick={onBack}>Cancel</button>
+            <button className="btn primary" onClick={start} disabled={loading}>{loading ? 'Starting…' : '⏺  Start Recording'}</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Playback Upload ───────────────────────────────────────────────────
+function PlaybackUpload({ onStart, onBack, autoOpen }) {
+  const [uploadStatus, setUploadStatus] = useState('Drop a bag file to upload');
+  const [statusType, setStatusType]     = useState('');
+  const [procState, setProcState]       = useState('idle');
+  const [procMsg, setProcMsg]           = useState('');
+  const [dragging, setDragging]         = useState(false);
+  const [recordings, setRecordings]     = useState([]);
+  const [openedName, setOpenedName]     = useState('');   // session being opened, shown in the topbar
+  const fileRef = useRef();
+  const pollRef = useRef();
+
+  useEffect(() => {
+    fetch(`${API}/recordings`)
+      .then(r => r.ok ? r.json() : [])
+      .then(arr => {
+        if (!Array.isArray(arr)) return;
+        const usable = arr.filter(r => r.has_metadata || (r.mcap_files || []).length > 0);
+        usable.sort((a, b) => (b.start_time_ns || 0) - (a.start_time_ns || 0));
+        setRecordings(usable);
+      })
+      .catch(() => {});
+  }, []);
+
+  function startPolling() {
+    setProcState('processing'); setProcMsg('Processing bag…');
+    clearInterval(pollRef.current);
+    pollRef.current = setInterval(async () => {
+      try {
+        const r2 = await fetch(`${API}/playback/status`);
+        const d2 = await r2.json();
+        setProcState(d2.state); setProcMsg(d2.progress || d2.error || '');
+        if (d2.state === 'ready' || d2.state === 'error') clearInterval(pollRef.current);
+      } catch {}
+    }, 800);
+  }
+
+  async function uploadFiles(fileList) {
+    const files = Array.from(fileList || []).filter(f => f && f.size >= 0);
+    if (!files.length) return;
+    // Folder name (from a directory pick) makes the nicest session name.
+    const folder = (files[0].webkitRelativePath || '').split('/')[0] || '';
+    const label = files.length === 1 ? files[0].name : `${files.length} files`;
+    setUploadStatus(`Uploading ${label}…`); setStatusType(''); setProcState('idle');
+    const fd = new FormData();
+    files.forEach(f => fd.append('files', f, f.name));
+    if (folder) fd.append('name', folder);
+    try {
+      const r = await fetch(`${API}/playback/upload-multi`, { method:'POST', body:fd });
+      if (!r.ok) throw new Error(await r.text());
+      const d = await r.json();
+      setOpenedName((d.path || '').split('/').filter(Boolean).pop() || folder || label);
+      setUploadStatus(`Uploaded → ${d.path}${d.note ? ' · ' + d.note : ''}`); setStatusType('ok');
+      startPolling();
+    } catch(e) { setUploadStatus(String(e).replace(/^Error:\s*/, '')); setStatusType('err'); }
+  }
+
+  async function openRecording(name) {
+    setUploadStatus(`Opening ${name}…`); setStatusType(''); setProcState('idle');
+    setOpenedName(name);
+    try {
+      const r = await fetch(`${API}/playback/open`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ name }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      setUploadStatus(`Opened → ${name}`); setStatusType('ok');
+      startPolling();
+    } catch(e) { setUploadStatus(String(e)); setStatusType('err'); }
+  }
+
+  useEffect(() => () => clearInterval(pollRef.current), []);
+
+  // Arriving from the home list or the annotations explorer: open immediately
+  useEffect(() => { if (autoOpen) openRecording(autoOpen); }, []);
+
+  const pct = (() => { const m = procMsg.match(/(\d+)%/); return m ? m[1] + '%' : '8%'; })();
+
+  return (
+    <div className="upload-screen fade-in">
+      <div className="setup-header">
+        <button className="back-btn" onClick={onBack}>← Back</button>
+        <h1>Upload Bag</h1>
+      </div>
+      <div className="upload-body">
+        <div className="upload-inner">
+          {recordings.length > 0 && (
+            <div style={{ marginBottom: 22 }}>
+              <div className="upload-title">Open a recording</div>
+              <div style={{ border:'1px solid var(--black)', maxHeight:190, overflowY:'auto' }}>
+                {recordings.map(rec => (
+                  <div key={rec.name}
+                    onClick={() => openRecording(rec.name)}
+                    style={{ display:'flex', justifyContent:'space-between', gap:12,
+                             padding:'9px 12px', cursor:'pointer',
+                             borderBottom:'1px solid var(--g5)',
+                             fontFamily:'var(--mono)', fontSize:12 }}
+                    onMouseEnter={e => e.currentTarget.style.background = 'var(--g6)'}
+                    onMouseLeave={e => e.currentTarget.style.background = ''}
+                  >
+                    <span style={{ overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{rec.name}</span>
+                    <span style={{ color:'var(--g3)', flexShrink:0 }}>
+                      {rec.duration_ns ? `${(rec.duration_ns / 1e9).toFixed(1)}s · ` : ''}
+                      {(rec.size_bytes / 1e6).toFixed(1)} MB
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          <div className="upload-title">{recordings.length > 0 ? 'Or upload a bag' : 'Select ROS 2 bag'}</div>
+          <div className={`drop-zone${dragging ? ' drag-over' : ''}`}
+            onClick={() => fileRef.current.click()}
+            onDragOver={e => { e.preventDefault(); setDragging(true); }}
+            onDragLeave={() => setDragging(false)}
+            onDrop={e => { e.preventDefault(); setDragging(false); if (e.dataTransfer.files.length) uploadFiles(e.dataTransfer.files); }}
+          >
+            <div className="dz-icon">UPLOAD</div>
+            <div className="dz-main">Drop files here or click to browse</div>
+            <div className="dz-sub">metadata.yaml + .mcap/.db3 · .zip / .tar.gz · or video files — no need to zip</div>
+            <div className="dz-sub" style={{ opacity: 0.7 }}>several videos upload together and play in sync</div>
+            <input ref={fileRef} type="file" multiple style={{ display:'none' }}
+              onChange={e => { if (e.target.files.length) uploadFiles(e.target.files); e.target.value=''; }} />
+          </div>
+          <div className={`status-bar ${statusType}`}>{uploadStatus}</div>
+          {procState === 'processing' && (
+            <div className="processing-bar">
+              <span>{procMsg}</span>
+              <div className="proc-progress"><div className="proc-fill" style={{ width: pct, animation: procMsg.includes('%') ? 'none' : undefined }} /></div>
+            </div>
+          )}
+          {procState === 'error'  && <div className="err-row">{procMsg}</div>}
+          {procState === 'ready'  && <div className="status-bar ok">✓ Ready to open</div>}
+          <div className="form-actions">
+            <button className="btn" onClick={onBack}>Cancel</button>
+            <button className="btn primary" onClick={() => onStart('playback', openedName)} disabled={procState !== 'ready'}>▶  Open Dashboard</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Dashboard ─────────────────────────────────────────────────────────
+function Dashboard({ mode, sessionName, onStop }) {
+  const [topicIndex, setTopicIndex]     = useState([]);
+  const [phaseIntervals, setPhaseIntervals] = useState([]);
+  const [tStart, setTStart]             = useState(null);
+  const [tEnd, setTEnd]                 = useState(null);
+  const [currentTime, setCurrentTime]   = useState(null);
+  const [openTopics, setOpenTopics]     = useState(new Set());
+  const [annotations, setAnnotations]   = useState([]);
+  const [annCollapsed, setAnnCollapsed] = useState(false);
+  const [leftCollapsed, setLeftCollapsed] = useState(false);
+  const [leftW, setLeftW]   = useState(() => { try { return parseInt(localStorage.getItem('haria_left_w'), 10) || 220; } catch { return 220; } });
+  const [rightW, setRightW] = useState(() => { try { return parseInt(localStorage.getItem('haria_right_w'), 10) || 260; } catch { return 260; } });
+  const [author, setAuthor]             = useState(() => { try { return localStorage.getItem('haria_author') || ''; } catch { return ''; } });
+  const [askAuthor, setAskAuthor]       = useState(false);
+  const [authorDraft, setAuthorDraft]   = useState('');
+  const [dirty, setDirty]               = useState(false);   // unsaved annotation changes
+  const [saving, setSaving]             = useState(false);
+  // Annotations persist as annotations.json next to the bag's .mcap/metadata.yaml.
+  // savedRef holds the last state known to be on disk; Stop prompts if they differ.
+  const savedRef = useRef('[]');
+
+  // Track whether the in-memory annotations differ from what's on disk, so the
+  // Save button can reflect it.
+  useEffect(() => { setDirty(JSON.stringify(annotations) !== savedRef.current); }, [annotations]);
+
+  // Persist user-set sidebar widths.
+  useEffect(() => { try { localStorage.setItem('haria_left_w', String(leftW)); } catch {} }, [leftW]);
+  useEffect(() => { try { localStorage.setItem('haria_right_w', String(rightW)); } catch {} }, [rightW]);
+
+  // Drag a sidebar's inner edge to resize it (left grows with +x, right with −x).
+  function startSidebarResize(side, e) {
+    e.preventDefault();
+    const startX = e.clientX, startL = leftW, startR = rightW;
+    const move = ev => {
+      if (side === 'left') setLeftW(Math.max(150, Math.min(500, startL + (ev.clientX - startX))));
+      else                 setRightW(Math.max(170, Math.min(560, startR - (ev.clientX - startX))));
+    };
+    const up = () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); };
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', up);
+  }
+
+  // A session must start with no codebook — it's per-session and never persists.
+  useEffect(() => { window.HariaResetCodebook && window.HariaResetCodebook(); }, []);
+
+  useEffect(() => {
+    fetch(`${API}/session/annotations`)
+      .then(r => r.ok ? r.json() : [])
+      .then(arr => {
+        if (Array.isArray(arr)) { savedRef.current = JSON.stringify(arr); setAnnotations(arr); }
+      })
+      .catch(() => {});
+  }, []);
+
+  // Ask who is annotating when a playback session opens (never during a
+  // recording — we can't interrupt a live capture). Prefilled with the
+  // remembered author, so it's usually one Enter.
+  useEffect(() => {
+    if (mode === 'playback') { setAuthorDraft(author); setAskAuthor(true); }
+  }, []);
+
+  function saveAuthor(v) {
+    const name = (v != null ? v : authorDraft).trim();
+    setAuthor(name);
+    try { localStorage.setItem('haria_author', name); } catch {}
+    setAskAuthor(false);
+  }
+
+  // Warn before closing the tab with unsaved annotation changes.
+  useEffect(() => {
+    function onBeforeUnload(e) {
+      if (JSON.stringify(annotations) !== savedRef.current) {
+        e.preventDefault(); e.returnValue = '';
+      }
+    }
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [annotations]);
+
+  async function saveAnnotations() {
+    const body = JSON.stringify(annotations);
+    const r = await fetch(`${API}/session/annotations`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+    });
+    if (!r.ok) throw new Error(await r.text());
+    savedRef.current = body;
+    setDirty(false);
+  }
+
+  async function handleSave() {
+    setSaving(true);
+    try { await saveAnnotations(); }
+    catch (e) { alert(`Saving failed: ${e.message || e}`); }
+    finally { setSaving(false); }
+  }
+
+  useEffect(() => {
+    async function poll() {
+      try {
+        const r = await fetch(`${API}/topics/index`);
+        if (!r.ok) return;
+        const d = await r.json();
+        setTopicIndex(d.topics || []);
+        setPhaseIntervals(d.phase_intervals || []);
+        // != null, not truthiness: a video-only session legitimately starts at
+        // t_start === 0, which would otherwise be skipped and leave the
+        // timeline uninitialised (playhead never starts moving).
+        // Record mode: lock the anchor to the FIRST t_start that is actually
+        // this recording's start — positive AND recent (within a few minutes of
+        // now). This rejects the default t_start:0 (before live_capture writes
+        // an index) and any stale index.json a previous playback/record left in
+        // session_out (an old epoch), either of which would make elapsed = the
+        // whole Unix epoch. Once locked it never changes, so the page/clock stay
+        // sane and annotation times track the recording.
+        if (mode === 'record') {
+          setTStart(p => {
+            if (p != null) return p;                       // locked
+            const now = Date.now() / 1000;
+            return (d.t_start > 0 && now - d.t_start < 300) ? d.t_start : p;
+          });
+        } else if (d.t_start != null) {
+          setTStart(d.t_start);
+        }
+        if (d.t_end   != null) setTEnd(d.t_end);
+      } catch {}
+    }
+    poll();
+    const t = setInterval(poll, 1500);
+    return () => clearInterval(t);
+  }, []);
+
+  useEffect(() => {
+    const t = setInterval(() => {
+      const next = window._hariaOpenTopics;
+      if (!next) return;
+      // Only trigger a re-render when the set actually changed
+      setOpenTopics(prev =>
+        prev.size === next.size && [...next].every(x => prev.has(x)) ? prev : new Set(next)
+      );
+    }, 500);
+    return () => clearInterval(t);
+  }, []);
+
+  // Video panels report their true duration once metadata loads, so a
+  // video-only session still gets a correct timeline when the server could not
+  // probe the container offline.
+  window._hariaExtendEnd = (secs) => {
+    setTEnd(prev => (prev == null || secs > prev) ? secs : prev);
+    setTStart(prev => (prev == null ? 0 : prev));
+  };
+
+  function handleAddPanel(meta, type) { if (window._hariaAddPanel) window._hariaAddPanel(meta, type); }
+  function handleAddAnnotation(ann)   {
+    const stamped = { created_at: new Date().toISOString(), author: author || '', ...ann };
+    setAnnotations(a => [...a, stamped]); setAnnCollapsed(false);
+  }
+  function handleDeleteAnnotation(id) { setAnnotations(a => a.filter(a => a.id !== id)); }
+  function handleUpdateAnnotation(id, patch) {
+  setAnnotations(a => a.map(x => x.id === id ? { ...x, ...patch } : x));
+}
+  function handleImport(arr) { setAnnotations(a => [...a, ...arr]); }
+  function download(text, filename, type) {
+    const url = URL.createObjectURL(new Blob([text], { type }));
+    const a = document.createElement('a');
+    a.href = url; a.download = filename; a.click();
+    URL.revokeObjectURL(url);
+  }
+  function handleExport() {
+    download(JSON.stringify(annotations, null, 2), 'haria_annotations.json', 'application/json');
+  }
+  function handleExportCsv() {
+    download(window.HariaAnnotationsToCsv(annotations), 'haria_annotations.csv', 'text/csv');
+  }
+  // Back = leave the session. Guards against losing unsaved annotations
+  // (there's a dedicated Save button in the annotations sidebar).
+  async function handleBack() {
+    if (dirty && !confirm('You have unsaved annotations. Leave without saving?')) return;
+    await fetch(`${API}${mode === 'record' ? '/recordings/stop' : '/playback/stop'}`, { method:'POST' }).catch(() => {});
+    onStop();
+  }
+
+  return (
+    <div className="dashboard fade-in"
+         style={{ gridTemplateColumns: `${leftCollapsed ? 36 : leftW}px 1fr ${annCollapsed ? 36 : rightW}px` }}>
+      {askAuthor && (
+        <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.5)', zIndex:9999,
+                      display:'flex', alignItems:'center', justifyContent:'center' }}
+             onClick={() => setAskAuthor(false)}>
+          <div onClick={e => e.stopPropagation()}
+               style={{ background:'#fff', color:'var(--black)', padding:20, borderRadius:6,
+                        minWidth:300, fontFamily:'var(--mono)', border:'1px solid var(--g4)' }}>
+            <div style={{ fontSize:12, fontWeight:600, marginBottom:4 }}>Who is annotating this session?</div>
+            <div style={{ fontSize:10, color:'var(--g3)', marginBottom:10 }}>
+              Applied to new annotations · editable per annotation later.
+            </div>
+            <input autoFocus value={authorDraft}
+              onChange={e => setAuthorDraft(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') saveAuthor(); if (e.key === 'Escape') setAskAuthor(false); }}
+              placeholder="Your name"
+              style={{ width:'100%', padding:'6px 8px', fontFamily:'var(--mono)', fontSize:12,
+                       border:'1px solid var(--g5)', borderRadius:4, marginBottom:12, boxSizing:'border-box' }} />
+            <div style={{ display:'flex', justifyContent:'flex-end', gap:8 }}>
+              <button className="ann-name-cancel" onClick={() => setAskAuthor(false)}>Skip</button>
+              <button className="ann-name-confirm" onClick={() => saveAuthor()}>Save</button>
+            </div>
+          </div>
+        </div>
+      )}
+      <div className="topbar" style={{ gridColumn:'1 / -1' }}>
+        <div className="tb-cell tb-brandcell">
+          <button className="tb-back" onClick={handleBack} title="Back to home">←</button>
+          <div className="tb-brand">HARIA</div>
+          {sessionName && <div className="tb-file" title={sessionName}>{sessionName}</div>}
+        </div>
+        <div className="tb-spacer" />
+      </div>
+
+      <window.HariaSidebar
+        topicIndex={topicIndex}
+        openTopics={openTopics}
+        onAddPanel={handleAddPanel}
+        collapsed={leftCollapsed}
+        onToggle={() => setLeftCollapsed(v => !v)}
+        onResizeStart={e => startSidebarResize('left', e)}
+      />
+
+      <window.HariaPanelArea
+        topicIndex={topicIndex}
+        currentTime={currentTime}
+      />
+
+      <window.HariaAnnotationsSidebar
+        mode={mode}
+        tStart={tStart}
+        annotations={annotations}
+        onDelete={handleDeleteAnnotation}
+        onUpdate={handleUpdateAnnotation}
+        onImport={handleImport}
+        onExport={handleExport}
+        onExportCsv={handleExportCsv}
+        onSave={handleSave}
+        dirty={dirty}
+        saving={saving}
+        collapsed={annCollapsed}
+        onToggle={() => setAnnCollapsed(v => !v)}
+        onResizeStart={e => startSidebarResize('right', e)}
+      />
+
+      <window.HariaTimelineContainer
+        mode={mode}
+        tStart={tStart}
+        tEnd={tEnd}
+        topicIndex={topicIndex}
+        onTimeChange={setCurrentTime}
+        annotations={annotations}
+        onAddAnnotation={handleAddAnnotation}
+        annCollapsed={annCollapsed}
+        onToggleAnn={() => setAnnCollapsed(v => !v)}
+        phaseIntervals={phaseIntervals}
+      />
+    </div>
+  );
+}
+
+// ── App ───────────────────────────────────────────────────────────────
+function App() {
+  const [screen, setScreen]     = useState('home');
+  const [mode, setMode]         = useState(null);
+  const [autoOpen, setAutoOpen] = useState(null);
+  const [sessionName, setSessionName] = useState('');
+
+  useEffect(() => { loadCategories(); }, []);
+
+  function openRecording(name, seekT) {
+    // A pending seek target is honoured by the timeline once the session loads
+    window._hariaSeekTo = (seekT != null && isFinite(seekT)) ? seekT : null;
+    setAutoOpen(name);
+    setMode('playback');
+    setScreen('playback-upload');
+  }
+  function goHome() { setMode(null); setAutoOpen(null); setScreen('home'); }
+
+  return (
+    <>
+      {screen === 'home' && (
+        <Home
+          onRecord={() => { setMode('record'); setScreen('record-setup'); }}
+          onPlayback={() => { setMode('playback'); setAutoOpen(null); setScreen('playback-upload'); }}
+          onAnnotations={() => setScreen('annotations')}
+          onOpenRecording={openRecording}
+        />
+      )}
+      {screen === 'annotations' && (
+        <window.HariaAnnotationsExplorer onBack={goHome} onOpenRecording={openRecording} />
+      )}
+      {screen === 'record-setup'    && <RecordSetup    onStart={(m, nm) => { setMode(m); setSessionName(nm || ''); setScreen('dashboard'); }} onBack={goHome} />}
+      {screen === 'playback-upload' && <PlaybackUpload onStart={(m, nm) => { setMode(m); setSessionName(nm || ''); setScreen('dashboard'); }} onBack={goHome} autoOpen={autoOpen} />}
+      {screen === 'dashboard'       && <Dashboard mode={mode} sessionName={sessionName} onStop={goHome} />}
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+})();
+</script>
+</body>
+</html>
