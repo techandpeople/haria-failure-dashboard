@@ -1,0 +1,12 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+recordings/
+cache/
+session_out/
+*.log
+.DS_Store
+node_modules

@@ -1,0 +1,53 @@
+# HARIA Failure Analysis Dashboard.
+#
+#   Playback (any OS):   docker compose up -d          → http://localhost:8000
+#   Record   (Linux):    docker compose --profile record up -d
+#
+# BAGS = the folder of rosbags to work in (mounted at /data). The launcher
+# writes it into a .env next to this file; edit BAGS there or export it.
+
+services:
+  # ── Playback / analysis — works on Linux, macOS, Windows ────────────────
+  haria:
+    image: ghcr.io/pipsrocha/hariadashboard:latest
+    build: ./dashboard-backend
+    ports:
+      - "8000:8000"
+    environment:
+      HARIA_ROOT: /data
+      HARIA_CACHE_DIR: /cache
+      HARIA_RECORDINGS_DIR: /data
+      # HARIA_LOCK_ROOT: "1"   # uncomment on a shared server to confine to /data
+    volumes:
+      - "${BAGS:-./bags}:/data"
+      - "haria-cache:/cache"
+    restart: unless-stopped
+
+  # ── Recording from a robot / local devices — Linux only ─────────────────
+  # Needs host networking (ROS 2 DDS discovery) and device passthrough, which
+  # only work on a Linux host. Start with:  docker compose --profile record up -d
+  haria-record:
+    image: ghcr.io/pipsrocha/hariadashboard:latest
+    build: ./dashboard-backend
+    profiles: ["record"]
+    network_mode: host          # DDS discovery to the robot on the LAN
+    environment:
+      HARIA_ROOT: /data
+      HARIA_CACHE_DIR: /cache
+      HARIA_RECORDINGS_DIR: /data
+      ROS_DOMAIN_ID: "${ROS_DOMAIN_ID:-0}"
+    volumes:
+      - "${BAGS:-./bags}:/data"
+      - "haria-cache:/cache"
+    # Pass through local capture devices. These are commented out because a
+    # hard device path fails `up` on machines that don't have it — uncomment
+    # and adjust for YOUR hardware (e.g. /dev/video2, and audio via /dev/snd).
+    # devices:
+    #   - "/dev/video0:/dev/video0"
+    #   - "/dev/snd:/dev/snd"
+    # group_add:
+    #   - audio
+    restart: unless-stopped
+
+volumes:
+  haria-cache:

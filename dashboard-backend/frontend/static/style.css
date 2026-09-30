@@ -303,7 +303,7 @@ canvas.panel-chart { position: absolute; inset: 0; width: 100% !important; heigh
 .tl-header {
   display: flex; align-items: stretch;
   border-bottom: 1px solid var(--black); flex-shrink: 0; height: 40px;
-  margin-right: 10px;
+  margin: 10 px;
 }
 .tl-hcell {
   padding: 0 14px; border-right: 1px solid var(--black);

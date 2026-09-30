@@ -1,7 +1,12 @@
-.venv/
 __pycache__/
 *.pyc
-recordings/
-session_out/
-*.log
-cache/
+.venv/
+venv/
+dashboard/
+
+# runtime data / local launcher config
+.env
+dashboard-backend/recordings/
+dashboard-backend/session_out/
+dashboard-backend/cache/
+bags/
